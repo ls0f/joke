@@ -2,18 +2,78 @@ package controllers
 
 import (
 	"github.com/astaxie/beego"
-	"github.com/hoisie/redis"
+	cluster2 "github.com/mediocregopher/radix.v2/cluster"
+	"github.com/mediocregopher/radix.v2/redis"
 	"strings"
+	"sync"
+	"time"
 )
 
-func initialRedis() *redis.Client {
-	db, _ := beego.AppConfig.Int("redisdb")
-	rc := &redis.Client{
-		Addr:     beego.AppConfig.String("redisaddr"),
-		Db:       db,
-		Password: beego.AppConfig.String("redispassword"),
+const (
+	Ping = time.Second * 10
+)
+
+var (
+	cluster *cluster2.Cluster
+	lock    sync.Mutex
+)
+
+func keepAlive(cluster *cluster2.Cluster, interval time.Duration) {
+	for {
+		<-time.After(interval)
+		// redis cluster heart beat.
+		clients, err := cluster.GetEvery()
+		if err != nil {
+			beego.BeeLogger.Error(err.Error())
+			// unable to do redis heart beat, log the error.
+			continue
+		}
+		for _, c := range clients {
+			if err := c.Cmd("PING").Err; err != nil {
+				beego.BeeLogger.Error(err.Error())
+				// unable to keep redis conn alive, log the error.
+				c.Close()
+				continue
+			}
+			cluster.Put(c)
+		}
+		// finished redis heart beat.
 	}
-	return rc
+}
+
+func newCluster() {
+	lock.Lock()
+	defer lock.Unlock()
+	if cluster != nil {
+		return
+	}
+	var err error
+	cluster, err = cluster2.NewWithOpts(cluster2.Opts{
+		Addr: beego.AppConfig.String("redisaddr"),
+		Dialer: func(network, addr string) (cli *redis.Client, err error) {
+			conn, err := redis.DialTimeout(network, addr, 2*time.Second)
+			if err != nil {
+				return nil, err
+			}
+			password := beego.AppConfig.String("redispassword")
+			if password != "" {
+				if conn.Cmd("AUTH", password).Err != nil {
+					beego.BeeLogger.Error(err.Error())
+					return nil, err
+				}
+			}
+			return conn, nil
+
+		},
+	})
+	if err != nil {
+		beego.BeeLogger.Error(err.Error())
+		if cluster == nil {
+			panic(err)
+		}
+	}
+
+	go keepAlive(cluster, Ping)
 }
 
 type Host struct {
@@ -23,25 +83,26 @@ type Host struct {
 
 type DNSController struct {
 	beego.Controller
-	rc *redis.Client
 }
 
 // http basic auth
 // init redis connect
 func (c *DNSController) Prepare() {
 	CheckAuth(c.Ctx)
-	c.rc = initialRedis()
+	newCluster()
 }
 
 func (c *DNSController) Get() {
 	var HostsRecord = make(map[string]string)
 	bindkey := beego.AppConfig.String("bindkey")
-	err := c.rc.Hgetall(bindkey, HostsRecord)
+	rsp := cluster.Cmd("HGETALL", bindkey)
+	HostsRecord, err := rsp.Map()
 	if err != nil {
-		panic(err)
+		beego.BeeLogger.Error(rsp.Err.Error())
 	}
 	c.Data["Redis"] = beego.AppConfig.String("redisaddr")
 	c.Data["Hosts"] = HostsRecord
+	c.Data["Version"] = beego.AppConfig.String("version")
 	c.Layout = "layout.html"
 	c.TplName = "dns.html"
 }
@@ -58,7 +119,7 @@ func (c *DNSController) Post() {
 	}
 	bindkey := beego.AppConfig.String("bindkey")
 
-	if _, err := c.rc.Hset(bindkey, strings.ToLower(h.Domain), []byte(h.IP)); err != nil {
+	if err := cluster.Cmd("HSET", bindkey, strings.ToLower(h.Domain), []byte(h.IP)).Err; err != nil {
 		c.Ctx.Abort(500, "Save hosts record failed")
 		beego.BeeLogger.Error(err.Error())
 		return
@@ -71,12 +132,11 @@ func (c *DNSController) Post() {
 
 type DNSDelController struct {
 	beego.Controller
-	rc *redis.Client
 }
 
 func (c *DNSDelController) Prepare() {
 	CheckAuth(c.Ctx)
-	c.rc = initialRedis()
+	newCluster()
 }
 
 func (c *DNSDelController) Post() {
@@ -86,7 +146,7 @@ func (c *DNSDelController) Post() {
 		return
 	}
 	bindkey := beego.AppConfig.String("bindkey")
-	if ok, err := c.rc.Hdel(bindkey, h.Domain); !ok {
+	if err := cluster.Cmd("HDEL", bindkey, h.Domain).Err; err != nil {
 		c.Ctx.Abort(500, "Delete hosts record failed")
 		beego.BeeLogger.Error(err.Error())
 		return
